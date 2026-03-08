@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>geoAI — NDWI (no keys, no backend)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Leaflet CSS/JS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <style>
+    :root { --bg:#0b0b0c; --fg:#f6f7f9; --card:#15161a; --accent:#ffd400; }
+    body { margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b0b0c; color:#f6f7f9; }
+    header { padding:16px 20px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; background:#0b0b0c; position:sticky; top:0; z-index:10; border-bottom:1px solid #222; }
+    header h1 { margin:0 12px 0 0; font-size:16px; font-weight:600; color:#ffd400; }
+    header input, header button { background:#15161a; color:#f6f7f9; border:1px solid #333; border-radius:10px; padding:8px 10px; font-size:14px; }
+    header button { cursor:pointer; border-color:#444; }
+    #msg { margin-left:auto; font-size:12px; opacity:.85; }
+    #map { width:100%; height: calc(100vh - 64px); }
+    .leaflet-control-layers-expanded { color:#111; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>geoAI — NDWI (no keys)</h1>
+    <label>Lat <input id="lat" type="number" step="0.0001" value="13.3409"></label>
+    <label>Lon <input id="lon" type="number" step="0.0001" value="74.7421"></label>
+    <label>Start <input id="start" type="date" value="2023-01-01"></label>
+    <label>End <input id="end" type="date" value="2023-12-31"></label>
+    <button id="go">Load</button>
+    <div id="msg">Public STAC + TiTiler tiles</div>
+  </header>
+
+  <div id="map"></div>
+
+  <script>
+    // Public endpoints (no auth):
+    const EARTH_SEARCH_URL = "https://earth-search.aws.element84.com/v1/search"; // STAC v1 (Sentinel‑2 & Landsat on AWS) [1](https://cocalc.com/github/python-visualization/folium/blob/main/examples/WMS_and_WMTS.ipynb)
+    const TITILER_STAC = "https://titiler.xyz/stac"; // Public demo TiTiler /stac (for tiles) [2](https://docs.maap-project.org/en/develop/technical_tutorials/visualization/visualizing_titiler-pgstac.html)
+
+    // Leaflet map
+    const map = L.map('map', { zoomControl: true }).setView([13.3409, 74.7421], 11);
+    const base = L.tileLayer(
+      // lightweight basemap
+      "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: "© OpenStreetMap" }
+    ).addTo(map);
+
+    let tcLayer = null;   // True Color
+    let ndwiLayer = null; // NDWI expression
+
+    function rfc3339Range(day) {
+      // returns day start/end RFC3339 (UTC)
+      // "YYYY-MM-DDT00:00:00Z/YYYY-MM-DDT23:59:59Z"
+      const s = `${day}T00:00:00Z`;
+      const e = `${day}T23:59:59Z`;
+      return [s, e];
+    }
+
+    function bboxFromPoint(lat, lon, km) {
+      const ddeg = km / 111.0;
+      return [lon - ddeg, lat - ddeg, lon + ddeg, lat + ddeg]; // [minLon,minLat,maxLon,maxLat]
+    }
+
+    async function stacSearchS2(lat, lon, startStr, endStr, cloud = 20, km = 15) {
+      // Build RFC3339 interval (allow YYYY-MM-DD form)
+      const s = `${startStr}T00:00:00Z`;
+      const e = `${endStr}T23:59:59Z`;
+      const bbox = bboxFromPoint(lat, lon, km);
+
+      const body = {
+        collections: ["sentinel-2-l2a"],
+        bbox: bbox,
+        datetime: `${s}/${e}`,
+        limit: 1,
+        query: { "eo:cloud_cover": { "lt": cloud } },
+        sortby: [{ field: "properties.eo:cloud_cover", direction: "asc" }]
+      };
+
+      const r = await fetch(EARTH_SEARCH_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        throw new Error(`STAC ${r.status}: ${t}`);
+      }
+      const data = await r.json();
+      const feats = data.features || [];
+      if (!feats.length) return { item: null, href: null };
+
+      const item = feats[0];
+      let selfHref = null;
+      (item.links || []).forEach(ln => {
+        if (ln.rel === "self") selfHref = ln.href;
+      });
+      if (!selfHref && item.id && item.collection) {
+        selfHref = `https://earth-search.aws.element84.com/v1/collections/${item.collection}/items/${item.id}`;
+      }
+      return { item, href: selfHref };
+    }
+
+    function addOrReplaceTile(layerRef, url, name, opts = {}) {
+      if (layerRef && map.hasLayer(layerRef)) map.removeLayer(layerRef);
+      const layer = L.tileLayer(url, Object.assign({
+        maxZoom: 19, opacity: 1.0, attribution: name
+      }, opts));
+      layer.addTo(map);
+      return layer;
+    }
+
+    function ensureLayersControl() {
+      if (!ensureLayersControl.ctrl) {
+        ensureLayersControl.ctrl = L.control.layers({ "OpenStreetMap": base }, {}, { collapsed: false }).addTo(map);
+      }
+      return ensureLayersControl.ctrl;
+    }
+
+    function updateMsg(text) {
+      document.getElementById("msg").textContent = text;
+    }
+
+    async function loadScene() {
+      const lat = parseFloat(document.getElementById("lat").value);
+      const lon = parseFloat(document.getElementById("lon").value);
+      const start = document.getElementById("start").value;
+      const end   = document.getElementById("end").value;
+      updateMsg("Searching STAC…");
+
+      let found = null;
+      try {
+        // Progressive attempts: tight → looser cloud/area
+        const attempts = [
+          { cloud: 20, km: 15 },
+          { cloud: 40, km: 25 },
+          { cloud: 60, km: 50 }
+        ];
+        for (const a of attempts) {
+          const res = await stacSearchS2(lat, lon, start, end, a.cloud, a.km);
+          if (res.item && res.href) { found = res; break; }
+        }
+      } catch (e) {
+        updateMsg(`STAC error: ${e.message}`);
+        return;
+      }
+      if (!found) {
+        updateMsg("No S2 L2A scene found in that window. Try broader dates or higher cloud.");
+        return;
+      }
+
+      const item = found.item;
+      const href = found.href;
+      const bbox = item.bbox || null;
+      if (bbox) {
+        const sw = [bbox[1], bbox[0]], ne = [bbox[3], bbox[2]];
+        map.fitBounds([sw, ne]);
+      } else {
+        map.setView([lat, lon], 11);
+      }
+
+      // Compose TiTiler /stac tile URLs:
+      // True color: assets=B04,B03,B02 with display scaling
+      const tc = `${TITILER_STAC}/tiles/WebMercatorQuad/{z}/{x}/{y}.png` +
+                 `?url=${encodeURIComponent(href)}` +
+                 `&assets=B04,B03,B02&rescale=0,3000`;
+
+      // NDWI = (B03-B08)/(B03+B08) with a colormap + rescale -1..1
+      const expr = "(B03-B08)/(B03+B08)";
+      const ndwi = `${TITILER_STAC}/tiles/WebMercatorQuad/{z}/{x}/{y}.png` +
+                   `?url=${encodeURIComponent(href)}` +
+                   `&expression=${encodeURIComponent(expr)}` +
+                   `&rescale=-1,1&colormap=viridis`;
+
+      try {
+        tcLayer = addOrReplaceTile(tcLayer, tc, "© S2 L2A (AWS) • TiTiler: True Color");
+        ndwiLayer = addOrReplaceTile(ndwiLayer, ndwi, "NDWI via TiTiler expression", { opacity: 0.8 });
+        const ctrl = ensureLayersControl();
+        ctrl.addOverlay(tcLayer, "Sentinel‑2 True Color");
+        ctrl.addOverlay(ndwiLayer, "NDWI (continuous)");
+        updateMsg(`Loaded: ${item.id} • cloud≈${Math.round(item.properties["eo:cloud_cover"] ?? 0)}%`);
+      } catch (e) {
+        updateMsg(`Tile error: ${e.message}`);
+      }
+    }
+
+    document.getElementById("go").addEventListener("click", loadScene);
+    // Load defaults on first paint:
+    loadScene();
+  </script>
+</body>
+</html>
